@@ -1,9 +1,10 @@
 streamlit
-yfinance
 pandas
 numpy
-plotly
+yfinance>=0.2.36
+gspread>=5.10.0
+google-auth>=2.20.0
 requests
-ta
-scikit-learn
-tensorflow
+beautifulsoup4
+lxml
+urllib3
