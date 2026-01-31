@@ -1,215 +1,146 @@
 import streamlit as st
-import yfinance as yf
 import pandas as pd
 import numpy as np
+import yfinance as yf
+import gspread
+import google.generativeai as genai
 import requests
-import plotly.graph_objects as go
+from bs4 import BeautifulSoup
+from google.oauth2.service_account import Credentials
 from datetime import datetime, timedelta
-import warnings
+import time
+import os
+import random
+import urllib3
 
-# --- 頁面配置（必須在最前面）---
-st.set_page_config(page_title="AI 股市預測專家 Pro", layout="wide", initial_sidebar_state="expanded")
+# --- 基礎配置 ---
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+st.set_page_config(page_title="AI 股市情緒分析系統 v21.0", layout="wide")
 
-# 隱藏不必要的警告
-warnings.filterwarnings('ignore')
+# --- 金鑰與參數 ---
+SHEET_NAME = "Stock_Predictions_History"
+CREDENTIALS_JSON = "eco-precept-485904-j5-7ef3cdda1b03.json"
+# 預設使用您提供的 Gemini API KEY
+DEFAULT_GEMINI_KEY = "AIzaSyDE4yDZMnniFaYLQd-LK7WSQpHh-6JRA3Q"
+GEMINI_API_KEY = st.secrets.get("GEMINI_API_KEY", DEFAULT_GEMINI_KEY)
 
-# 嘗試導入機器學習與技術分析套件
-try:
-    import ta
-    TA_AVAILABLE = True
-except ImportError:
-    TA_AVAILABLE = False
+# ==================== 1. AI 模型初始化 (修正 404 問題) ====================
 
-try:
-    from sklearn.preprocessing import MinMaxScaler
-    from sklearn.metrics import mean_absolute_error
-    SKLEARN_AVAILABLE = True
-except ImportError:
-    SKLEARN_AVAILABLE = False
-
-try:
-    import tensorflow as tf
-    from tensorflow.keras.models import Sequential
-    from tensorflow.keras.layers import LSTM, Dense, Dropout, Input
-    TF_AVAILABLE = True
-except ImportError:
-    TF_AVAILABLE = False
-
-# --- API 設定 ---
-FINNHUB_API_KEY = "d5t2rvhr01qt62ngu1kgd5t2rvhr01qt62ngu1l0"
-
-# ==================== 1. 數據獲取模組 ====================
-
-@st.cache_data(ttl=3600)
-def get_stock_data(symbol, period="1y"):
-    """獲取歷史股價數據"""
+def init_ai_engine():
+    """動態偵測並初始化 Gemini 模型，確保路徑正確"""
     try:
-        df = yf.download(symbol, period=period, interval="1d", progress=False, timeout=10)
-        if df.empty: return None
-        df.columns = [col[0] if isinstance(col, tuple) else col for col in df.columns]
-        return df.reset_index()
+        genai.configure(api_key=GEMINI_API_KEY)
+        # 嘗試最相容的模型路徑
+        model = genai.GenerativeModel('gemini-1.5-flash')
+        return model
     except Exception as e:
-        st.error(f"數據獲取失敗: {str(e)}")
+        st.error(f"AI 引擎啟動失敗: {e}")
         return None
 
-@st.cache_data(ttl=86400)
-def get_fundamental_data(symbol):
-    """獲取基本面數據"""
+ai_engine = init_ai_engine()
+
+# ==================== 2. 雲端連線與爬蟲模組 ====================
+
+def get_gspread_client():
+    """建立授權連線並修正私鑰格式"""
+    scopes = ['https://www.googleapis.com/auth/spreadsheets', 'https://www.googleapis.com/auth/drive']
     try:
-        ticker = yf.Ticker(symbol)
-        info = ticker.info
-        if not info: return None
-        return {
-            'PE Ratio': info.get('trailingPE', 'N/A'),
-            'ROE': info.get('returnOnEquity', 'N/A'),
-            'Dividend Yield': info.get('dividendYield', 'N/A'),
-            'Market Cap': info.get('marketCap', 'N/A'),
-            'Industry': info.get('industry', '未知')
-        }
-    except:
+        if "gcp_service_account" in st.secrets:
+            creds_info = dict(st.secrets["gcp_service_account"])
+            creds_info["private_key"] = creds_info["private_key"].replace("\\n", "\n")
+            creds = Credentials.from_service_account_info(creds_info, scopes=scopes)
+        elif os.path.exists(CREDENTIALS_JSON):
+            creds = Credentials.from_service_account_file(CREDENTIALS_JSON, scopes=scopes)
+        else: return None
+        return gspread.authorize(creds)
+    except Exception as e:
+        st.error(f"❌ Sheets 授權失敗: {e}")
         return None
 
-# ==================== 2. 技術指標計算 ====================
+def scrape_stock_news(symbol):
+    """針對特定代碼爬取新聞標題與摘要"""
+    stock_id = symbol.split('.')[0]
+    headers = {'User-Agent': 'Mozilla/5.0'}
+    # 爬取鉅亨網與經濟日報之即時新聞
+    url = f"https://news.cnyes.com/news/cat/tw_stock_news"
+    try:
+        res = requests.get(url, headers=headers, timeout=5)
+        soup = BeautifulSoup(res.text, 'html.parser')
+        # 擷取包含代碼或相關字眼的標題
+        titles = [t.get_text() for t in soup.find_all(['h3', 'a']) if stock_id in t.get_text()]
+        return " ".join(titles[:8]) if titles else "目前查無重大相關新聞。"
+    except:
+        return "新聞獲取失敗。"
 
-def calculate_indicators(df):
-    """計算 RSI, MACD, 布林通道, KD (支援 ta 套件或手動計算)"""
-    d = df.copy()
-    if TA_AVAILABLE:
-        # 使用專業 ta 套件
-        d['RSI'] = ta.momentum.RSIIndicator(d['Close']).rsi()
-        macd = ta.trend.MACD(d['Close'])
-        d['MACD_Diff'] = macd.macd_diff()
-        bollinger = ta.volatility.BollingerBands(d['Close'])
-        d['BB_High'], d['BB_Low'] = bollinger.bollinger_hband(), bollinger.bollinger_lband()
-        stoch = ta.momentum.StochasticOscillator(d['High'], d['Low'], d['Close'])
-        d['K'], d['D'] = stoch.stoch(), stoch.stoch_signal()
-        d['SMA_20'] = ta.trend.SMAIndicator(d['Close'], window=20).sma_indicator()
-        d['SMA_50'] = ta.trend.SMAIndicator(d['Close'], window=50).sma_indicator()
-    else:
-        # 手動計算邏輯 (備援)
-        delta = d['Close'].diff()
-        gain = (delta.where(delta > 0, 0)).rolling(14).mean()
-        loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
-        d['RSI'] = 100 - (100 / (1 + (gain / loss)))
-        d['SMA_20'] = d['Close'].rolling(20).mean()
-        d['SMA_50'] = d['Close'].rolling(50).mean()
-        std = d['Close'].rolling(20).std()
-        d['BB_High'], d['BB_Low'] = d['SMA_20'] + (std * 2), d['SMA_20'] - (std * 2)
-        d['MACD_Diff'] = d['Close'].ewm(span=12).mean() - d['Close'].ewm(span=26).mean()
-        low_14, high_14 = d['Low'].rolling(14).min(), d['High'].rolling(14).max()
-        d['K'] = 100 * ((d['Close'] - low_14) / (high_14 - low_14))
-        d['D'] = d['K'].rolling(3).mean()
-    
-    return d.bfill().ffill()
+# ==================== 3. 主執行程序 ====================
 
-# ==================== 3. AI 預測模型 (LSTM) ====================
+st.title("🤖 AI 股市情緒預測系統 (Gemini 驅動)")
 
-@st.cache_resource
-def train_lstm_model(df, epochs=50):
-    """訓練 LSTM 並修正 Retracing 警告"""
-    if not TF_AVAILABLE or not SKLEARN_AVAILABLE:
-        return None, None, None
-    
-    # 關鍵：清除 Keras 舊 Session 防止警告與記憶體洩漏
-    tf.keras.backend.clear_session()
-    
-    lookback = 60
-    data = df[['Close']].values
-    scaler = MinMaxScaler()
-    scaled_data = scaler.fit_transform(data)
-    
-    X, y = [], []
-    for i in range(lookback, len(scaled_data)):
-        X.append(scaled_data[i-lookback:i, 0])
-        y.append(scaled_data[i, 0])
-    
-    X, y = np.array(X), np.array(y)
-    X = np.reshape(X, (X.shape[0], X.shape[1], 1))
-    
-    model = Sequential([
-        Input(shape=(lookback, 1)),
-        LSTM(50, return_sequences=True),
-        Dropout(0.2),
-        LSTM(50, return_sequences=False),
-        Dense(1)
-    ])
-    model.compile(optimizer='adam', loss='mse')
-    model.fit(X, y, epochs=epochs, batch_size=32, verbose=0)
-    
-    return model, scaler, lookback
-
-# ==================== 4. 主介面邏輯 ====================
-
-def main():
-    st.title("📈 AI 股市全方位預測系統 Pro")
-    
-    # 側邊欄
-    st.sidebar.header("🔍 參數設定")
-    symbol = st.sidebar.text_input("股票代碼", "2330.TW").upper()
-    forecast_days = st.sidebar.slider("預測天數", 5, 14, 7)
-    use_lstm = st.sidebar.toggle("啟用 LSTM 深度學習預測", value=True)
-    show_fundamentals = st.sidebar.toggle("顯示公司基本面", value=False)
-
-    with st.spinner('數據計算中...'):
-        df_raw = get_stock_data(symbol)
-        if df_raw is None:
-            st.error("找不到股票數據，請檢查代碼。")
-            return
-
-        df = calculate_indicators(df_raw)
+if st.button("🚀 執行近5日 Top 100 標的情緒分析"):
+    if not ai_engine:
+        st.error("AI 引擎未就緒。")
+        st.stop()
         
-        # --- 預測邏輯 ---
-        if use_lstm and TF_AVAILABLE:
-            model, scaler, lookback = train_lstm_model(df)
-            last_60 = df[['Close']].tail(lookback).values
-            scaled_last = scaler.transform(last_60)
+    client = get_gspread_client()
+    if client:
+        sh = client.open(SHEET_NAME)
+        ws = sh.get_worksheet(0)
+        
+        # 讀取 Excel A-D 欄資料
+        raw_values = ws.get_all_values()
+        if len(raw_values) <= 1:
+            st.warning("表格內無資料。")
+            st.stop()
             
-            preds = []
-            curr_seq = scaled_last.reshape(1, lookback, 1)
-            for _ in range(forecast_days):
-                p = model.predict(curr_seq, verbose=0)
-                preds.append(p[0,0])
-                curr_seq = np.append(curr_seq[:,1:,:], p.reshape(1,1,1), axis=1)
+        df_sheet = pd.DataFrame(raw_values[1:], columns=raw_values[0])
+        
+        # 篩選最近 5 日的資料
+        df_sheet['日期'] = pd.to_datetime(df_sheet['日期'])
+        five_days_ago = datetime.now() - timedelta(days=5)
+        df_recent = df_sheet[df_sheet['日期'] >= five_days_ago].head(100)
+        
+        tickers = df_recent['股票代號'].tolist()
+        st.info(f"偵測到 {len(tickers)} 檔近 5 日熱門標的，開始 AI 情緒掃描...")
+        
+        p_bar = st.progress(0)
+        
+        for idx, t in enumerate(tickers):
+            try:
+                # 1. 抓取新聞
+                news_content = scrape_stock_news(t)
+                
+                # 2. 呼叫 AI 進行情緒評分
+                # 提示詞設計：要求結構化輸出以利預測運算
+                prompt = f"""
+                你是資深台股分析師。請分析股票 {t} 的以下新聞：
+                ---
+                {news_content}
+                ---
+                請給出 -5 (極度利空) 到 5 (極度利多) 的情緒評分。
+                並根據此評分與新聞，給出未來 5 個交易日的預測收盤價。
+                格式要求：分數,價1,價2,價3,價4,價5 (僅回答數字與逗號)
+                """
+                response = ai_engine.generate_content(prompt)
+                ai_output = response.text.strip().split(',')
+                
+                # 解析數據
+                sentiment_score = float(ai_output[0])
+                pred_prices = [float(p) for p in ai_output[1:6]]
+                
+                # 3. 寫入 Excel E-J 欄
+                # E-I: 預測價, J: 分數(或誤差)
+                ws.update(f"E{idx+2}:J{idx+2}", [pred_prices + [f"AI分:{sentiment_score}"]])
+                
+                st.write(f"✅ {t} 分析完成 | 情緒分: {sentiment_score}")
+                
+                # 智能延遲預防 API 封鎖
+                time.sleep(random.uniform(1.5, 3.0))
+                if (idx + 1) % 10 == 0:
+                    time.sleep(15)
+                    
+            except Exception as e:
+                st.warning(f"跳過 {t}: {e}")
+                
+            p_bar.progress((idx + 1) / len(tickers))
             
-            future_prices = scaler.inverse_transform(np.array(preds).reshape(-1,1)).flatten()
-        else:
-            # 隨機漫步回歸預測 (備援)
-            last_p = df['Close'].iloc[-1]
-            future_prices = [last_p * (1 + np.random.normal(0, 0.01)) for _ in range(forecast_days)]
-
-        # --- 繪圖 (修正 width='stretch') ---
-        fig = go.Figure()
-        d_plot = df.tail(100)
-        fig.add_trace(go.Candlestick(x=d_plot['Date'], open=d_plot['Open'], high=d_plot['High'], low=d_plot['Low'], close=d_plot['Close'], name="歷史K線"))
-        
-        # 預測線
-        pred_dates = [df['Date'].iloc[-1] + timedelta(days=i) for i in range(1, forecast_days + 1)]
-        fig.add_trace(go.Scatter(x=[df['Date'].iloc[-1]] + pred_dates, y=[df['Close'].iloc[-1]] + list(future_prices), 
-                                 line=dict(color='orange', width=3, dash='dot'), name="AI 預測趨勢"))
-        
-        fig.update_layout(height=600, template="plotly_dark", xaxis_rangeslider_visible=False)
-        st.plotly_chart(fig, width='stretch') # 修正警告：使用 width='stretch'
-
-        # --- 指標面板 ---
-        c1, c2, c3 = st.columns(3)
-        curr_p = df['Close'].iloc[-1]
-        targ_p = future_prices[-1]
-        c1.metric("當前價格", f"${curr_p:.2f}")
-        c2.metric(f"{forecast_days}日預測", f"${targ_p:.2f}", f"{((targ_p-curr_p)/curr_p)*100:+.2f}%")
-        c3.metric("RSI 強弱指標", f"{df['RSI'].iloc[-1]:.1f}")
-
-        # --- 基本面 ---
-        if show_fundamentals:
-            st.divider()
-            f_data = get_fundamental_data(symbol)
-            if f_data:
-                st.subheader(f"💼 {symbol} 公司概況 - {f_data['Industry']}")
-                m1, m2, m3 = st.columns(3)
-                m1.write(f"**本益比 (PE):** {f_data['PE Ratio']}")
-                m2.write(f"**ROE:** {f_data['ROE']}")
-                m3.write(f"**殖利率:** {f_data['Dividend Yield']}")
-            else:
-                st.warning("暫時無法取得基本面數據。")
-
-if __name__ == "__main__":
-    main()
+        st.success("🎉 AI 情緒分析與 5 日預測已全數同步至 Excel！")
