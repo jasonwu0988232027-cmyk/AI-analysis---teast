@@ -4,6 +4,7 @@ numpy
 yfinance>=0.2.36
 gspread>=5.10.0
 google-auth>=2.20.0
+google-generativeai>=0.4.0
 requests
 beautifulsoup4
 lxml
