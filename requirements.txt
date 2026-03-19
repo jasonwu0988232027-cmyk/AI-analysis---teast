@@ -1,6 +1,16 @@
-streamlit 
-yfinance 
-pandas 
-tqdm 
-pygad 
-matplotlib
+# 基礎數據處理
+pandas
+numpy
+
+# 金融數據獲取
+yfinance
+
+# 遺傳算法核心
+pygad
+
+# 統計學計算
+scipy
+
+# 前端介面與可視化
+streamlit
+plotly
