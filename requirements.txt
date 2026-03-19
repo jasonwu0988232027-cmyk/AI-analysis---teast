@@ -1,16 +1,16 @@
 # 基礎數據處理
-pandas
-numpy
+pandas>=2.0.0
+numpy>=1.24.0
 
 # 金融數據獲取
-yfinance
+yfinance>=0.2.30
 
 # 遺傳算法核心
-pygad
+pygad>=3.0.0
 
 # 統計學計算
-scipy
+scipy>=1.10.0
 
 # 前端介面與可視化
-streamlit
-plotly
+streamlit>=1.25.0
+plotly>=5.15.0
