@@ -1,145 +1,146 @@
 import streamlit as st
+import yfinance as yf
 import pandas as pd
 import numpy as np
-import yfinance as yf
-import gspread
-from openai import OpenAI
-from google.oauth2.service_account import Credentials
-from datetime import datetime
-import time
-import sys
+import pygad
+import matplotlib.pyplot as plt
+from datetime import datetime, timedelta
 
-# --- 基礎編碼設定 ---
-st.set_page_config(page_title="GPT-4o 高速進化分析系統 v33.0", layout="wide")
-
-def get_gspread_client():
-    scopes = ['https://www.googleapis.com/auth/spreadsheets', 'https://www.googleapis.com/auth/drive']
-    if "gcp_service_account" in st.secrets:
-        try:
-            creds_info = dict(st.secrets["gcp_service_account"])
-            pk = str(creds_info["private_key"]).strip().replace('"', '').replace("'", "").replace("\\n", "\n")
-            creds_info["private_key"] = pk
-            return gspread.authorize(Credentials.from_service_account_info(creds_info, scopes=scopes))
-        except Exception as e:
-            st.error(f"❌ Sheets 授權失敗: {e}")
-    return None
-
-OPENAI_API_KEY = st.secrets.get("OPENAI_API_KEY")
-client_ai = OpenAI(api_key=OPENAI_API_KEY)
-
-# ==================== 1. 分頁初始化與權重計算 ====================
-
-def init_and_sync_sheets(sh, target_tickers):
-    """初始化分頁並記錄權重占比"""
-    # 第一頁：預測紀錄
-    ws_pred = sh.get_worksheet(0)
-    
-    # 第二頁：權重占比
+# --- 1. 數據獲取模塊 (參考來源 [1]) ---
+@st.cache_data
+def fetch_stock_data(ticker, start_date, end_date):
+    """下載指定股票數據"""
     try:
-        ws_weight = sh.worksheet("Stock_Weights")
-    except gspread.exceptions.WorksheetNotFound:
-        ws_weight = sh.add_worksheet(title="Stock_Weights", rows="1000", cols="5")
-        ws_weight.insert_row(["股票代號", "權重占比", "更新日期", "說明"], 1)
-    
-    # 簡單計算等權重（或可根據交易值自定義）
-    today_str = datetime.now().strftime("%Y-%m-%d")
-    weight_pct = f"{round(1/len(target_tickers), 4)*100}%" if target_tickers else "0%"
-    weight_rows = [[t, weight_pct, today_str, "自動分配"] for t in target_tickers]
-    
-    # 清除舊權重並寫入新權重
-    ws_weight.clear()
-    ws_weight.insert_row(["股票代號", "權重占比", "更新日期", "說明"], 1)
-    ws_weight.append_rows(weight_rows)
-    
-    return ws_pred
+        data = yf.download(ticker, start=start_date, end=end_date)
+        if data.empty:
+            return None
+        return data
+    except Exception as e:
+        st.error(f"數據下載失敗: {e}")
+        return None
 
-# ==================== 2. 高速 AI 反思分析 ====================
-
-def ai_reflection_analysis(ticker, curr_p, last_record, tech_data):
-    """利用 Tier 1 的效能進行高速反思分析"""
-    prompt = f"""
-    標的: {ticker}, 現價: {curr_p}
-    量化指標: {tech_data}
-    上次預測記錄: {last_record if last_record else "無"}
-    
-    請進行：
-    1. 自我反思：若有上次記錄，請簡述預測準確度。
-    2. 未來預測：給出未來5日價格預測。
-    回答格式: 分數,價1,價2,價3,價4,價5,反思短評(30字)
+# --- 2. 交易回測邏輯 (參考來源 [2, 4]) ---
+def run_backtest(data, short_window, long_window):
     """
-    response = client_ai.chat.completions.create(
-        model="gpt-4o",
-        messages=[{"role": "system", "content": "你是具備自我修正能力的交易分析師。"},
-                  {"role": "user", "content": prompt}],
-        temperature=0.3
+    執行簡單的均線交叉策略
+    short_window: 短期均線天數 (基因1)
+    long_window: 長期均線天數 (基因2)
+    """
+    df = data.copy()
+    # 確保窗口為整數且短期小於長期
+    short_window = int(short_window)
+    long_window = int(long_window)
+    
+    if short_window >= long_window:
+        return -100 # 不合理的參數給予懲罰
+        
+    df['SMA_S'] = df['Close'].rolling(window=short_window).mean()
+    df['SMA_L'] = df['Close'].rolling(window=long_window).mean()
+    
+    # 產生信號
+    df['Signal'] = 0.0
+    df.loc[df.index[short_window:], 'Signal'] = np.where(
+        df['SMA_S'][short_window:] > df['SMA_L'][short_window:], 1.0, 0.0
     )
-    return response.choices[0].message.content.strip().split(',')
-
-# ==================== 3. 主程序 ====================
-
-st.title("⚡ GPT-4o 高速進化分析系統 v33.0 (Tier 1)")
-
-if st.button("🚀 啟動高速全方位分析任務"):
-    gc = get_gspread_client()
-    if not gc: st.stop()
+    df['Position'] = df['Signal'].diff()
     
-    sh = gc.open("Stock_Predictions_History")
+    # 計算收益 (假設初始資金 10000)
+    df['Market_Return'] = df['Close'].pct_change()
+    df['Strategy_Return'] = df['Market_Return'] * df['Signal'].shift(1)
     
-    # 讀取現有預測清單 (假設在第一頁的 B 欄)
-    ws_temp = sh.get_worksheet(0)
-    all_rows = ws_temp.get_all_values()
-    df_history = pd.DataFrame(all_rows[1:], columns=all_rows[0]) if len(all_rows) > 1 else pd.DataFrame()
+    # 計算累計收益
+    cumulative_return = (1 + df['Strategy_Return'].fillna(0)).cumprod()
+    total_return = cumulative_return.iloc[-1] - 1
     
-    # 取得要分析的代號 (近5日內出現過的標的)
-    if not df_history.empty:
-        tickers = df_history['股票代號'].unique().tolist()[:100]
-    else:
-        st.warning("請先在 Excel B 欄填入股票代號。")
-        st.stop()
+    # 計算最大回撤 (來源 [2] 強調考慮風險)
+    peak = cumulative_return.expanding(min_periods=1).max()
+    drawdown = (cumulative_return/peak) - 1
+    max_drawdown = drawdown.min()
+    
+    # 適應度函數：不僅看收益，還看風險 (收益 / |最大回撤|)
+    # 來源 [3] 提到捕捉低效市場時需穩健性
+    fitness = total_return / (abs(max_drawdown) + 0.01) 
+    
+    return fitness, cumulative_return, total_return, max_drawdown
 
-    # 初始化與同步權重
-    ws_pred = init_and_sync_sheets(sh, tickers)
-    
-    today_str = datetime.now().strftime("%Y-%m-%d")
-    p_bar = st.progress(0)
-    status = st.empty()
-    
-    # 高速下載數據
-    all_hist = yf.download(tickers, period="1mo", group_by='ticker', progress=False)
+# --- 3. 遺傳算法設置 (參考來源 [2]) ---
+def fitness_func(ga_instance, solution, solution_idx):
+    """遺傳算法的適應度評估函數"""
+    short_w, long_w = solution
+    # 使用全域變數中的數據進行回測
+    fitness_value, _, _, _ = run_backtest(st.session_state.market_data, short_w, long_w)
+    return fitness_value
 
-    for idx, t in enumerate(tickers):
-        try:
-            status.text(f"⚡ 高速處理中 ({idx+1}/{len(tickers)}): {t}")
-            
-            df = all_hist[t].dropna() if isinstance(all_hist.columns, pd.MultiIndex) else all_hist.dropna()
-            if df.empty: continue
-            
-            curr_p = round(float(df['Close'].iloc[-1]), 2)
-            tech_info = "MA5 > MA20" if (len(df)>1 and df['Close'].rolling(5).mean().iloc[-1] > df['Close'].rolling(20).mean().iloc[-1]) else "MA5 < MA20"
-            
-            # 獲取該股票的最後一筆歷史預測
-            last_rec = df_history[df_history['股票代號'] == t].tail(1).to_dict('records')
-            
-            # 呼叫 AI (Tier 1 環境，不再需要 sleep 21秒)
-            res = ai_reflection_analysis(t, curr_p, last_rec, tech_info)
-            
-            # 準備寫入資料
-            new_row = [today_str, t, curr_p, "交易值指標", res[1], res[2], res[3], res[4], res[5], res[0], res[6]]
-            
-            # --- 判斷更新或追加 ---
-            mask = (df_history['日期'] == today_str) & (df_history['股票代號'] == t)
-            if not df_history.empty and mask.any():
-                row_idx = df_history.index[mask][0] + 2
-                ws_pred.update(f"A{row_idx}:K{row_idx}", [new_row])
-            else:
-                ws_pred.append_row(new_row)
-            
-            # 僅保留極短的間隔(0.2秒)確保 API 請求順序
-            time.sleep(0.2)
-            
-        except Exception as e:
-            st.warning(f"跳過 {t}: {e}")
-            
-        p_bar.progress((idx + 1) / len(tickers))
+# --- 4. Streamlit UI 界面 ---
+st.title("🧬 AI 遺傳算法自動構建交易策略")
+st.write("結合 DeepSeek 思路與遺傳算法，自動搜索最優策略參數 [2, 4]")
 
-    st.success(f"🎉 高速分析任務完成！共處理 {len(tickers)} 檔標的。資料已同步至 Excel 兩個分頁。")
+# 側邊欄配置
+st.sidebar.header("1. 數據設定")
+ticker = st.sidebar.text_input("股票代碼 (e.g. AAPL, TSLA)", "AAPL")
+days = st.sidebar.slider("回測天數", 365, 1825, 730)
+
+st.sidebar.header("2. 遺傳算法參數")
+num_generations = st.sidebar.slider("進化代數 (Generations)", 10, 100, 20)
+sol_per_pop = st.sidebar.slider("種群大小 (Population Size)", 10, 50, 20)
+
+# 執行流程
+end_date = datetime.now()
+start_date = end_date - timedelta(days=days)
+
+if st.sidebar.button("開始進化策略"):
+    with st.spinner('正在下載數據並執行遺傳進化...'):
+        data = fetch_stock_data(ticker, start_date, end_date)
+        
+        if data is not None:
+            st.session_state.market_data = data
+            
+            # 初始化 PyGAD
+            # 基因空間：短期均線 (5-50), 長期均線 (50-200)
+            ga_instance = pygad.GA(
+                num_generations=num_generations,
+                num_parents_mating=5,
+                fitness_func=fitness_func,
+                sol_per_pop=sol_per_pop,
+                num_genes=2,
+                gene_space=[range(5, 51), range(51, 201)],
+                mutation_percent_genes=10
+            )
+            
+            # 執行進化
+            ga_instance.run()
+            
+            # 獲取最佳結果
+            solution, solution_fitness, _ = ga_instance.best_solution()
+            best_short, best_long = solution
+            
+            # 重新運行回測以獲取圖表數據
+            _, final_curve, final_ret, final_mdd = run_backtest(data, best_short, best_long)
+            
+            # --- 顯示結果 ---
+            st.success("🎉 進化完成！")
+            col1, col2, col3 = st.columns(3)
+            col1.metric("最佳短期均線", f"{int(best_short)} 天")
+            col2.metric("最佳長期均線", f"{int(best_long)} 天")
+            col3.metric("適應度評分", f"{solution_fitness:.2f}")
+            
+            st.metric("累計收益率", f"{final_ret*100:.2f}%")
+            st.metric("最大回撤 (Risk)", f"{final_mdd*100:.2f}%")
+            
+            # 繪製曲線圖
+            st.subheader("策略收益曲線")
+            fig, ax = plt.subplots(figsize=(10, 5))
+            ax.plot(final_curve, label='Strategy (GA Optimized)', color='orange')
+            ax.plot((1 + data['Close'].pct_change().fillna(0)).cumprod(), label='Market (Buy & Hold)', alpha=0.5)
+            ax.legend()
+            st.pyplot(fig)
+            
+            # 顯示進化歷史 (收斂情況)
+            st.subheader("遺傳算法收斂歷史")
+            fig_fitness = ga_instance.plot_fitness()
+            st.pyplot(fig_fitness)
+            
+        else:
+            st.error("無法獲取數據，請檢查代碼或網路連接。")
+else:
+    st.info("👈 請在左側設定參數並點擊『開始進化策略』")
