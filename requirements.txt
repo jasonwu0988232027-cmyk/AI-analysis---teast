@@ -1,7 +1,6 @@
-streamlit>=1.30.0
-yfinance==0.2.36
-pandas>=2.1.0
-numpy>=1.24.0
-pygad>=3.0.0
-scipy>=1.10.0
-plotly>=5.15.0
+streamlit 
+yfinance 
+pandas 
+tqdm 
+pygad 
+matplotlib
