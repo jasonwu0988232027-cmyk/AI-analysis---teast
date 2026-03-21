@@ -1,9 +1,24 @@
 import yfinance as yf
 import pandas as pd
 import numpy as np
-import warnings
+import time
+import os
+import sys
 
-warnings.filterwarnings('ignore') # 忽略一些 pandas 計算產生的警告
+# Optional Streamlit Import
+try:
+    import streamlit as st
+    STREAMLIT_AVAILABLE = True
+except ImportError:
+    STREAMLIT_AVAILABLE = False
+
+UNIVERSE = [
+    '2330.TW', '2317.TW', '2454.TW', '2308.TW', '2382.TW', 
+    '2881.TW', '2882.TW', '2883.TW', '2884.TW', '2885.TW', 
+    '2886.TW', '2887.TW', '2890.TW', '2891.TW', '2892.TW',
+    '2603.TW', '2609.TW', '2615.TW', 
+    '2606.TW', '2610.TW'
+]
 
 def calculate_atr(df, period=14):
     high = df['High']
@@ -18,90 +33,81 @@ def calculate_atr(df, period=14):
     atr = tr.rolling(window=period).mean()
     return atr
 
-def calculate_poc(df_slice, step=2.0):
-    if df_slice.empty: return np.nan
-    top = df_slice['High'].max()
-    bottom = df_slice['Low'].min()
+def calculate_poc(df, step=2.0):
+    if df.empty: return np.nan
+    top = df['High'].max()
+    bottom = df['Low'].min()
     if pd.isna(top) or pd.isna(bottom) or top == bottom:
         return np.nan
         
     dynRows = max(1, int(round((top - bottom) / step)))
     actual_step = (top - bottom) / dynRows
-    if actual_step == 0:
-        return np.nan
     
     bins = np.zeros(dynRows)
     bin_tops = bottom + actual_step * np.arange(1, dynRows + 1)
     bin_bots = bottom + actual_step * np.arange(0, dynRows)
     
-    h = df_slice['High'].values
-    l = df_slice['Low'].values
-    v = df_slice['Volume'].values
-    
-    for i in range(len(h)):
-        if pd.isna(h[i]) or pd.isna(l[i]) or pd.isna(v[i]) or h[i] == l[i]:
+    for h, l, v in zip(df['High'], df['Low'], df['Volume']):
+        if pd.isna(h) or pd.isna(l) or pd.isna(v) or h == l:
             continue
-        intersect_mask = (bin_bots <= h[i]) & (bin_tops >= l[i])
+        intersect_mask = (bin_bots <= h) & (bin_tops >= l)
         intersect_count = np.sum(intersect_mask)
         if intersect_count > 0:
-            bins[intersect_mask] += v[i] / intersect_count
+            bins[intersect_mask] += v / intersect_count
             
     max_bin_idx = np.argmax(bins)
     poc = (bin_tops[max_bin_idx] + bin_bots[max_bin_idx]) / 2.0
     return poc
 
-def main():
-    print("====== 股票策略回測系統 ======")
-    ticker = input("請輸入要回測的股票代碼 (例如 2330.TW, 2603.TW): ").strip()
-    if not ticker:
-        print("未輸入代碼，預設使用 2330.TW")
-        ticker = "2330.TW"
-        
-    print(f"\n[{ticker}] 正在下載歷史資料 (預設使用過去 3 年資料以確保有足夠的指標計算長度)...")
-    df = yf.download(ticker, period="3y", progress=False)
-    
-    # 處理 yfinance 可能返回的 MultiIndex
-    if isinstance(df.columns, pd.MultiIndex):
-        try:
-            df = df.xs(ticker, level=1, axis=1)
-        except:
-            df.columns = df.columns.droplevel(1)
+def fetch_data(tickers, progress_callback=None):
+    all_data = []
+    chunk_size = 20
+    for i in range(0, len(tickers), chunk_size):
+        chunk = tickers[i:i+chunk_size]
+        msg = f"Downloading batch {i//chunk_size + 1}/{max(1, (len(tickers)-1)//chunk_size + 1)}: {chunk}"
+        if progress_callback:
+            progress_callback(msg)
             
-    df.dropna(how='all', inplace=True)
-    
-    # 需要至少大約一年的資料來計算 52週 POC
-    poc_window = 252 
-    if len(df) <= poc_window:
-        print(f"資料筆數 ({len(df)}) 不足一年，無法安全計算 52週 POC，請選擇上市較久的股票。")
-        return
+        df = yf.download(chunk, period="1y", group_by="ticker", progress=False)
+        all_data.append(df)
+        time.sleep(1)
+        
+    processed_dfs = []
+    for chunk, df in zip([tickers[i:i+chunk_size] for i in range(0, len(tickers), chunk_size)], all_data):
+        if len(chunk) == 1:
+            ticker = chunk[0]
+            df.columns = pd.MultiIndex.from_product([[ticker], df.columns])
+        processed_dfs.append(df)
+        
+    final_df = pd.concat(processed_dfs, axis=1)
+    final_df.dropna(how='all', axis=1, inplace=True)
+    return final_df
 
-    print("資料下載完成，正在計算技術指標與滾動式 POC (Rolling POC 避免未來函數)...")
+def apply_strategy(df_ticker):
+    df = df_ticker.copy()
+    if df.empty or len(df) < 60:
+        return None
+        
     df['ATR'] = calculate_atr(df)
+    df['MA60'] = df['Close'].rolling(window=60).mean()
+    df['POC'] = calculate_poc(df)
     
-    # 滾動計算 POC（使用過去 252 天資料作為近 52 週的分布）
-    poc_series = np.full(len(df), np.nan)
-    for i in range(poc_window, len(df)):
-        df_slice = df.iloc[i-poc_window:i]
-        poc_series[i] = calculate_poc(df_slice)
-    df['POC'] = poc_series
+    df['Signal_Buy'] = (df['Close'].shift(1) <= df['POC']) & (df['Close'] > df['POC'])
+    df['Score'] = (df['Close'] / df['MA60']) - 1
     
-    # 計算買入訊號：昨日收盤 <= 昨日POC 且 今日收盤 > 今日POC
-    df['Signal_Buy'] = (df['Close'].shift(1) <= df['POC'].shift(1)) & (df['Close'] > df['POC'])
-    
-    # 計算 Stop Loss, Take Profit
-    # 原本邏輯：Trailing Stop Loss 以及 取 Global High 為 Take Profit
     stop_loss = np.full(len(df), np.nan)
     take_profit = np.full(len(df), np.nan)
+    fib_618 = np.full(len(df), np.nan)
     
     global_high = -np.inf
-    atr_values = df['ATR'].values
-    high_values = df['High'].values
+    high_idx = 0
+    swing_low = np.inf
     
     for i in range(1, len(df)):
-        today_high = high_values[i]
-        today_atr = atr_values[i]
+        today_high = df['High'].iloc[i]
+        today_low = df['Low'].iloc[i]
+        today_atr = df['ATR'].iloc[i]
         
-        # 1. Trailing Stop Loss
         if not np.isnan(today_atr) and not np.isnan(today_high):
             current_sl = today_high - 2 * today_atr
             if np.isnan(stop_loss[i-1]):
@@ -111,180 +117,152 @@ def main():
         else:
             stop_loss[i] = stop_loss[i-1]
             
-        # 2. Dynamic Take Profit (All Time High / Local High)
         if not np.isnan(today_high):
             if today_high > global_high:
+                old_high_idx = high_idx
                 global_high = today_high
-            if global_high != -np.inf:
+                high_idx = i
+                
+                if old_high_idx < high_idx and old_high_idx > 0:
+                    swing_low = df['Low'].iloc[old_high_idx:high_idx+1].min()
+                else:
+                    swing_low = df['Low'].iloc[:high_idx+1].min()
+            
+            if global_high != -np.inf and swing_low != np.inf:
+                diff = global_high - swing_low
+                fib_618[i] = global_high - 0.618 * diff
                 take_profit[i] = global_high
     
     df['Stop_Loss'] = stop_loss
     df['Take_Profit'] = take_profit
-    
-    # 執行回測引擎
-    run_backtest(df, ticker)
+    df['Fib_0.618'] = fib_618
+    return df
 
-def run_backtest(df, ticker, initial_capital=100000.0):
-    print("\n========== 開始執行回測模擬 ==========")
-    capital = initial_capital
-    position = 0
-    entry_price = 0
-    entry_date = None
-    trades = []
+def run_strategy(progress_callback=None):
+    if progress_callback:
+        progress_callback("Fetching data from Yahoo Finance...")
+    df_all = fetch_data(UNIVERSE, progress_callback)
+    results = {}
     
-    dates = df.index
-    open_prices = df['Open'].values
-    high_prices = df['High'].values
-    low_prices = df['Low'].values
-    close_prices = df['Close'].values
-    buy_signals = df['Signal_Buy'].values
-    stop_losses = df['Stop_Loss'].values
-    take_profits = df['Take_Profit'].values
-    
-    equity_curve = []
-    
-    for i in range(1, len(df)):
-        current_date = dates[i]
-        O, H, L, C = open_prices[i], high_prices[i], low_prices[i], close_prices[i]
-        
-        # 判斷是否觸發平倉 (使用昨天的 SL / TP 設定)
-        if position > 0:
-            sl = stop_losses[i-1]
-            tp = take_profits[i-1]
-            
-            sold = False
-            sell_price = 0
-            reason = ""
-            
-            # 若開盤直接跳空跌破停損
-            if O <= sl:
-                sold = True
-                sell_price = O
-                reason = "Stop Loss (Gap Down)"
-            # 盤中跌破停損
-            elif L <= sl:
-                sold = True
-                sell_price = sl
-                reason = "Stop Loss"
-            # 若開盤直接跳空突破停利
-            elif O >= tp:
-                sold = True
-                sell_price = O
-                reason = "Take Profit (Gap Up)"
-            # 盤中突破停利
-            elif H >= tp:
-                sold = True
-                sell_price = tp
-                reason = "Take Profit"
+    if isinstance(df_all.columns, pd.MultiIndex):
+        if len(df_all.columns.levels) == 2:
+            if 'Close' in df_all.columns.levels[0]:
+                is_price_first = True
+                close_px = df_all.xs('Close', level=0, axis=1)
+                vol = df_all.xs('Volume', level=0, axis=1)
+            else:
+                is_price_first = False
+                close_px = df_all.xs('Close', level=1, axis=1)
+                vol = df_all.xs('Volume', level=1, axis=1)
                 
-            if sold:
-                capital = position * sell_price
-                ret = (sell_price - entry_price) / entry_price
-                trades.append({
-                    '進場時間': entry_date.date() if hasattr(entry_date, 'date') else entry_date,
-                    '出場時間': current_date.date() if hasattr(current_date, 'date') else current_date,
-                    '進場價格': round(entry_price, 2),
-                    '出場價格': round(sell_price, 2),
-                    '報酬率(%)': round(ret * 100, 2),
-                    '出場原因': reason
-                })
-                position = 0
-        
-        # 判斷是否可以進場 (昨天出現買進訊號，今天開盤買進)
-        if position == 0 and buy_signals[i-1]:
-            # 用今日開盤價買進 (假設市價買入，資本全下)
-            position = capital / O
-            entry_price = O
-            entry_date = current_date
-            capital = 0 
+            trading_value = close_px * vol
+            idx = -1
+            latest_tv = trading_value.iloc[idx].dropna()
+            while latest_tv.empty and abs(idx) < len(trading_value):
+                idx -= 1
+                latest_tv = trading_value.iloc[idx].dropna()
+                
+            top_100_tickers = latest_tv.nlargest(100).index.tolist()
+            if progress_callback:
+                progress_callback(f"--- 篩選成交值前 100 名熱門股 ---\n共擷取 {len(top_100_tickers)} 檔")
             
-        # 紀錄每日收盤淨值
-        current_equity = position * C if position > 0 else capital
-        equity_curve.append({
-            'Date': current_date,
-            'Equity': current_equity
-        })
-        
-    # 回測結束，清倉 (按照最後一天收盤價)
-    if position > 0:
-        current_equity = position * close_prices[-1]
-        ret = (close_prices[-1] - entry_price) / entry_price
-        trades.append({
-            '進場時間': entry_date.date() if hasattr(entry_date, 'date') else entry_date,
-            '出場時間': dates[-1].date() if hasattr(dates[-1], 'date') else dates[-1],
-            '進場價格': round(entry_price, 2),
-            '出場價格': round(close_prices[-1], 2),
-            '報酬率(%)': round(ret * 100, 2),
-            '出場原因': "End of Backtest"
-        })
-    else:
-        current_equity = capital
-        
-    equity_df = pd.DataFrame(equity_curve).set_index('Date')
+            for ticker in top_100_tickers:
+                if ticker not in UNIVERSE: continue
+                try:
+                    df_ticker = df_all.xs(ticker, level=1, axis=1).copy() if is_price_first else df_all[ticker].copy()
+                    df_ticker.dropna(how='all', inplace=True)
+                    res = apply_strategy(df_ticker)
+                    if res is not None:
+                        results[ticker] = res.iloc[-1].to_dict()
+                except Exception as e:
+                    if progress_callback:
+                        progress_callback(f"Error processing {ticker}: {e}")
     
-    # 列印回測分析
-    total_return = ((current_equity - initial_capital) / initial_capital) * 100
-    trades_df = pd.DataFrame(trades)
-    
-    print("\n========== 回測績效報告 ==========")
-    print(f"回測標的:\t {ticker}")
-    print(f"初始資金:\t ${initial_capital:,.2f}")
-    print(f"最終資金:\t ${current_equity:,.2f}")
-    print(f"總報酬率:\t {total_return:.2f}%")
-    
-    if not trades_df.empty:
-        win_trades = trades_df[trades_df['報酬率(%)'] > 0]
-        loss_trades = trades_df[trades_df['報酬率(%)'] <= 0]
-        win_rate = len(win_trades) / len(trades_df) * 100
-        
-        print(f"總交易次數:\t {len(trades_df)}")
-        print(f"勝率:\t\t {win_rate:.2f}% ({len(win_trades)} 勝 / {len(loss_trades)} 敗)")
-        print(f"平均每筆報酬:\t {trades_df['報酬率(%)'].mean():.2f}%")
-        if len(win_trades) > 0:
-            print(f"平均獲利報酬:\t {win_trades['報酬率(%)'].mean():.2f}%")
-        if len(loss_trades) > 0:
-            print(f"平均虧損報酬:\t {loss_trades['報酬率(%)'].mean():.2f}%")
+    summary_df = pd.DataFrame(results).T
+    if not summary_df.empty:
+        if 'Score' in summary_df.columns:
+            summary_df.sort_values(by='Score', ascending=False, inplace=True)
             
-        equity_df['High_Water_Mark'] = equity_df['Equity'].cummax()
-        equity_df['Drawdown'] = (equity_df['Equity'] - equity_df['High_Water_Mark']) / equity_df['High_Water_Mark']
-        max_drawdown = equity_df['Drawdown'].min() * 100
-        print(f"最大回撤 (MDD):\t {max_drawdown:.2f}%")
+        cols_to_show = ['Close', 'Signal_Buy', 'POC', 'Score', 'Stop_Loss', 'Take_Profit', 'Fib_0.618']
+        cols_to_show = [c for c in cols_to_show if c in summary_df.columns]
+        summary_df = summary_df[cols_to_show]
+    
+    return summary_df
+
+def terminal_main():
+    summary_df = run_strategy(lambda msg: print(msg))
+    if not summary_df.empty:
+        print("\n--- Latest Trading Signals (Sorted by Strength Score) ---")
+        print(summary_df)
         
-        print("\n--- 交易明細 (前 5 筆) ---")
-        print(trades_df.head(5).to_string(index=False))
-        print("...\n--- 交易明細 (最後 5 筆) ---")
-        print(trades_df.tail(5).to_string(index=False))
-        
-        # 將所有交易紀錄輸出至 CSV
-        csv_filename = f"{ticker}_trades.csv"
-        trades_df.to_csv(csv_filename, index=False)
-        print(f"\n💡 完整交易明細已匯出至 {csv_filename}")
-        
+        buy_candidates = summary_df[summary_df['Signal_Buy'] == True]
+        if not buy_candidates.empty:
+            print("\n💡 今日符合所有入場條件（收盤價向上穿越 52週 POC）可選購之股票：")
+            print(", ".join(list(buy_candidates.index)))
+        else:
+            print("\n💡 今日無符合所有入場條件之股票。")
+            
+        summary_df.to_csv("trading_signals.csv")
+        print("\nSaved to trading_signals.csv successfully.")
     else:
-        print("沒有發生任何交易 (未觸發進場訊號)。")
-        
-    # 可視化 (如果系統有安裝 matplotlib)
-    try:
-        import matplotlib.pyplot as plt
-        plt.rcParams['font.sans-serif'] = ['Microsoft JhengHei'] # 設定中文字體 (Windows)
-        plt.rcParams['axes.unicode_minus'] = False 
-        
-        plt.figure(figsize=(12, 6))
-        plt.plot(equity_df.index, equity_df['Equity'], label='策略累積淨值 (Equity)', color='b')
-        plt.fill_between(equity_df.index, equity_df['Equity'], initial_capital, where=(equity_df['Equity'] > initial_capital), color='g', alpha=0.3)
-        plt.fill_between(equity_df.index, equity_df['Equity'], initial_capital, where=(equity_df['Equity'] <= initial_capital), color='r', alpha=0.3)
-        plt.axhline(initial_capital, color='black', linestyle='--', label='初始資金')
-        plt.title(f'【{ticker}】策略回測權益曲線', fontsize=16)
-        plt.xlabel('日期', fontsize=12)
-        plt.ylabel('淨值', fontsize=12)
-        plt.legend(loc='upper left')
-        plt.grid(True, linestyle='--', alpha=0.6)
-        
-        png_filename = f"{ticker}_equity_curve.png"
-        plt.savefig(png_filename)
-        print(f"💡 權益曲線圖表已儲存為 {png_filename}")
-    except ImportError:
-        print("\n(溫馨提示：若想生成回測圖表，請安裝 matplotlib 模組: pip install matplotlib)")
+        print("No data processed.")
+
+def streamlit_main():
+    if not STREAMLIT_AVAILABLE:
+        print("Streamlit 尚未安裝，請先執行 `pip install streamlit`")
+        return
+
+    st.set_page_config(page_title="台股交易策略: Volume Profile", layout="wide")
+    st.title("📈 台股交易策略: VPFR 動態突破與籌碼分析")
+    st.markdown("自動掃描市場熱門股，透過 **Volume Profile (POC)** 判斷籌碼密集區突破，並搭配 **ATR 移動停損** 與 **斐波納契回撤** 控制風險。")
+    
+    @st.cache_data(ttl=3600, show_spinner=False)
+    def cached_run_strategy():
+        return run_strategy()
+    
+    if st.button("🚀 執行選股與更新資料", use_container_width=True) or 'df' in st.session_state:
+        with st.spinner("從 Yahoo Finance 下載最新市場資料中...請稍候... (需花費幾秒鐘時間)"):
+            summary_df = cached_run_strategy()
+            st.session_state['df'] = summary_df
+            
+        if not summary_df.empty:
+            buy_candidates = summary_df[summary_df['Signal_Buy'] == True]
+            
+            if not buy_candidates.empty:
+                st.success("🎯 **今日發現符合進場條件的熱門股！**")
+                st.write(", ".join(list(buy_candidates.index)))
+            else:
+                st.info("💡 **今日無符合「收盤價向上穿越 52週 POC」條件之股票。**")
+            
+            st.subheader("📊 最新策略訊號排名 (根據強勢度 Score 排列)")
+            
+            # 使用 dataframe 呈現，並標記買入訊號
+            def highlight_buy(s):
+                return ['background-color: #2e7d32; color: white' if v else '' for v in s]
+            
+            styled_df = summary_df.style.apply(highlight_buy, subset=['Signal_Buy'] if 'Signal_Buy' in summary_df.columns else None)
+            st.dataframe(styled_df, use_container_width=True, height=600)
+            
+            csv = summary_df.to_csv().encode('utf-8-sig')
+            st.download_button(
+                label="📥 下載 CSV 訊號報表",
+                data=csv,
+                file_name='trading_signals.csv',
+                mime='text/csv',
+            )
+        else:
+            st.warning("無資料可顯示。")
 
 if __name__ == "__main__":
-    main()
+    is_streamlit = False
+    if sys.argv and len(sys.argv) > 0:
+        if 'streamlit' in sys.argv[0] or 'streamlit' in sys.modules:
+            is_streamlit = True
+            
+    if 'STREAMLIT_RUNTIME' in os.environ:
+        is_streamlit = True
+        
+    if is_streamlit:
+        streamlit_main()
+    else:
+        terminal_main()
