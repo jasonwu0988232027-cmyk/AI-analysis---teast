@@ -1,6 +1,4 @@
-streamlit 
-yfinance 
-pandas 
-tqdm 
-pygad 
+yfinance
+pandas
+numpy
 matplotlib
